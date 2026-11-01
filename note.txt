@@ -1,0 +1,24 @@
+
+test_posts = {1 : { "title": "First Post", "content": "This is the first post."},
+              2: { "title": "Second Post", "content": "This is the second post."},
+              3: { "title": "Third Post", "content": "This is the third post."},
+              4: { "title": "Fourth Post", "content": "This is the fourth post."}}
+
+@app.get("/posts")
+def get_posts(limit: int = None):
+    if limit:
+        return list(test_posts.values())[:limit]
+    return test_posts
+
+
+@app.get("/posts/{post_id}")
+def get_post(post_id: int) -> PostResponse:
+    if post_id not in test_posts:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return test_posts[post_id]
+
+@app.post("/posts")
+def create_post(post: PostCreate) -> PostResponse:
+    new_post = {"title": post.title, "content": post.content}
+    test_posts[len(test_posts) + 1] = new_post
+    return new_post
