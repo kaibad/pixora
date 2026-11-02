@@ -1,16 +1,21 @@
-from fastapi import FastAPI,HTTPException, File, UploadFile, Form, Depends
-from pixora.schema import PostCreate, PostResponse, PostResponse
-from pixora.db import  Post, create_db_and_tables, get_async_session
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
-from contextlib import asynccontextmanager
 from sqlalchemy import select
+from contextlib import asynccontextmanager
+
+from pixora.db import Post, create_db_and_tables, get_async_session
+from pixora.images import imagekit
+import uuid
+
+MAX_IMAGE_SIZE = 10 * 1024 * 1024 # 10 MB
+MAX_VIDEO_SIZE = 100 * 1024 * 1024 # 100 MB
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create the database and tables on startup
     await create_db_and_tables()
     yield
-    # Perform any cleanup tasks on shutdown if needed
 
 app = FastAPI(title="Pixora", lifespan=lifespan)
 
@@ -25,26 +30,63 @@ def health():
     return {"status": "ok"}
 
 
+# Upload file endpoint
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
     caption: str = Form(...),
-    # this is a dependency that will provide a session for each request. dependency injection is a way to provide dependencies to a function or class without having to create them manually. in this case, we are using the get_async_session function to provide a session for each request. the session will be used to interact with the database.
-    session: AsyncSession = Depends(get_async_session)
+    session: AsyncSession = Depends(get_async_session),
 ):
+    content_type = file.content_type or ""
+    if content_type.startswith("image/"):
+        file_type, max_size = "image", MAX_IMAGE_SIZE
+    elif content_type.startswith("video/"):
+        file_type, max_size = "video", MAX_VIDEO_SIZE
+    else:
+        raise HTTPException(status_code=400, detail="Only image or video files are allowed")
+
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(status_code=413, detail=f"{file_type} is too large")
+
+    try:
+        #run_in_threadpool runs a normal (blocking) function in a separate thread, so it doesn’t freeze your async server while it waits.
+        # BAD: blocks the entire server during the upload
+        # result = imagekit.files.upload(file=file.file, file_name=file.filename)
+        # GOOD: upload runs in a worker thread, the event loop stays free
+        # The syntax is run_in_threadpool(function, *args, **kwargs). Note that you pass the function without parentheses, and the arguments follow it. FastAPI then calls imagekit.files.upload(file=..., file_name=...) in a thread and gives you the result when it’s done, and the await lets other requests run in the meantime.
+        result = await run_in_threadpool(
+            imagekit.files.upload,
+            file=file.file,                     
+            file_name=file.filename,
+            folder=f"/pixora/{file_type}s",
+            tags=["pixora-backend-upload"],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ImageKit upload failed: {e}")
+    finally:
+        await file.close()
+
     post = Post(
         caption=caption,
-        url="dummy url",
-        file_type="image",
-        file_name="dummy name"
+        url=result.url,
+        file_type=file_type,
+        file_name=result.name,
     )
     session.add(post)
     await session.commit()
     await session.refresh(post)
-    return {post}
+
+    return {
+        "id": str(post.id),
+        "caption": post.caption,
+        "url": post.url,
+        "file_type": post.file_type,
+        "file_name": post.file_name,
+        "created_at": post.created_at.isoformat(),
+    }
 
 
-
+# Get feed endpoint
 @app.get("/feed")
 async def get_feed(
     session: AsyncSession = Depends(get_async_session)
@@ -66,3 +108,25 @@ async def get_feed(
         )
 
     return {"posts": posts_data}
+
+# delete post endpoint
+@app.delete("/posts/{post_id}")
+async def delete_post(
+    post_id: str,
+    session: AsyncSession = Depends(get_async_session)
+):
+    try:
+        post_uuid = uuid.UUID(post_id)
+
+        result = await session.execute(select(Post).where(Post.id == post_uuid)) 
+        post = result.scalars().first()
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+
+        await session.delete(post)
+        await session.commit()
+
+        return {"success": True, "message": "Post deleted successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
