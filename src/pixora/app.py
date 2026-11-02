@@ -8,6 +8,12 @@ from pixora.db import Post, create_db_and_tables, get_async_session
 from pixora.images import imagekit
 import uuid
 
+from pixora.users import fastapi_users, auth_backend, current_active_user
+from pixora.schema import UserRead, UserCreate, UserUpdate
+from pixora.db import User
+
+from sqlalchemy.orm import selectinload
+
 MAX_IMAGE_SIZE = 10 * 1024 * 1024 # 10 MB
 MAX_VIDEO_SIZE = 100 * 1024 * 1024 # 100 MB
 
@@ -18,6 +24,22 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Pixora", lifespan=lifespan)
+
+app.include_router(
+    fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_register_router(UserRead, UserCreate), prefix="/auth", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_reset_password_router(), prefix="/auth", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_verify_router(UserRead), prefix="/auth", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_users_router(UserRead, UserUpdate), prefix="/users", tags=["users"]
+)
 
 
 @app.get("/")
@@ -35,6 +57,7 @@ def health():
 async def upload_file(
     file: UploadFile = File(...),
     caption: str = Form(...),
+    user: User = Depends(current_active_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     content_type = file.content_type or ""
@@ -67,10 +90,12 @@ async def upload_file(
         await file.close()
 
     post = Post(
+        user_id=user.id,  
         caption=caption,
         url=result.url,
         file_type=file_type,
         file_name=result.name,
+        file_id=result.file_id,  
     )
     session.add(post)
     await session.commit()
@@ -89,44 +114,53 @@ async def upload_file(
 # Get feed endpoint
 @app.get("/feed")
 async def get_feed(
-    session: AsyncSession = Depends(get_async_session)
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session),
 ):
-    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
-    posts = [row[0] for row in result.fetchall()]
+    result = await session.execute(
+        select(Post).options(selectinload(Post.user)).order_by(Post.created_at.desc())
+    )
+    posts = result.scalars().all()
 
-    posts_data = []
-    for post in posts:
-        posts_data.append(
+    return {
+        "posts": [
             {
-                "id": str(post.id),
-                "caption": post.caption,
-                "url": post.url,
-                "file_type": post.file_type,
-                "file_name": post.file_name,
-                "created_at": post.created_at.isoformat(),
+                "id": str(p.id),
+                "user_id": str(p.user_id),
+                "caption": p.caption,
+                "url": p.url,
+                "file_type": p.file_type,
+                "file_name": p.file_name,
+                "created_at": p.created_at.isoformat(),
+                "email": p.user.email,
+                "is_owner": p.user_id == user.id,
+                "email": p.user.email
             }
-        )
-
-    return {"posts": posts_data}
+            for p in posts
+        ]
+    }
 
 # delete post endpoint
 @app.delete("/posts/{post_id}")
 async def delete_post(
-    post_id: str,
-    session: AsyncSession = Depends(get_async_session)
+    post_id: uuid.UUID,
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session),
 ):
-    try:
-        post_uuid = uuid.UUID(post_id)
+    post = await session.get(Post, post_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your post")
 
-        result = await session.execute(select(Post).where(Post.id == post_uuid)) 
-        post = result.scalars().first()
-        if not post:
-            raise HTTPException(status_code=404, detail="Post not found")
+    # delete from ImageKit first; if it fails, the DB row stays so you can retry
+    if post.file_id:
+        try:
+            await run_in_threadpool(imagekit.files.delete, post.file_id)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"ImageKit delete failed: {e}")
 
-        await session.delete(post)
-        await session.commit()
+    await session.delete(post)
+    await session.commit()
 
-        return {"success": True, "message": "Post deleted successfully"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"success": True, "message": "Post deleted successfully"}
